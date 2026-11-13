@@ -1,6 +1,6 @@
 import os, io, glob, subprocess, tempfile, threading, traceback, requests
 from flask import Flask, request, abort
-from PIL import Image
+from PIL import Image, ImageOps
 
 app = Flask(__name__)
 SECRET = os.environ["RENDER_SECRET"]
@@ -68,6 +68,20 @@ def fit(em, eh, W):
     return em
 
 
+def make_background(d, W, H, bgc):
+    """Однотонный фон или фото пользователя (подгоняется под W x H с обрезкой краёв)"""
+    base = Image.new("RGBA", (W, H), bgc)
+    if d.get("bg_url"):
+        try:
+            raw = requests.get(d["bg_url"], timeout=30).content
+            photo = ImageOps.exif_transpose(Image.open(io.BytesIO(raw))).convert("RGBA")
+            photo = ImageOps.fit(photo, (W, H), Image.LANCZOS)
+            return Image.alpha_composite(base, photo)
+        except Exception:
+            print("BG ERROR", traceback.format_exc(), flush=True)
+    return base
+
+
 def job(d):
     chat, wid = d["chat_id"], d.get("wait_id")
     try:
@@ -86,7 +100,7 @@ def job(d):
             kind = detect_kind(src)
             count, sfps, get = load_source(kind, src, tmp, eh)
 
-            bg_img = Image.new("RGBA", (W, H), bgc)
+            bg_img = make_background(d, W, H, bgc)
 
             def compose(em):
                 em = fit(em, eh, W)
@@ -95,11 +109,9 @@ def job(d):
                 return Image.alpha_composite(bg_img, layer).convert("RGB")
 
             mid = compose(get(min(count // 2, count - 1)))
-            bbox = get(min(count // 2, count - 1)).getchannel("A").getbbox()
-            print("DEBUG", "kind", kind, "frames", count, "alpha_bbox", bbox,
-                  "out", W, H, FPS, flush=True)
+            print("DEBUG", "kind", kind, "frames", count,
+                  "bg_photo", bool(d.get("bg_url")), "out", W, H, FPS, flush=True)
 
-            # превью для Telegram (иначе он показывает чёрный квадрат)
             th = mid.copy()
             th.thumbnail((320, 320))
             buf = io.BytesIO()
@@ -129,7 +141,6 @@ def job(d):
                 if proc.returncode:
                     raise RuntimeError(open(f"{tmp}/ff.log", "rb").read()[-800:].decode(errors="ignore"))
 
-            # GIF в Telegram = беззвучное mp4, отправленное как animation
             method = "sendAnimation" if fmt == "gif" else "sendVideo"
             field = "animation" if fmt == "gif" else "video"
             data = {"chat_id": chat, "width": W, "height": H, "duration": SECONDS}
