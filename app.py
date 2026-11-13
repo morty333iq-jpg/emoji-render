@@ -10,9 +10,12 @@ API = f"https://api.telegram.org/bot{TOKEN}"
 ERR = '<b><tg-emoji emoji-id="5870657884844462243">❌</tg-emoji> Не получилось сделать</b>'
 SECONDS = 3
 
+ENC = ["-c:v", "libx264", "-preset", "ultrafast", "-crf", "23",
+       "-pix_fmt", "yuv420p", "-an", "-movflags", "+faststart"]
+
 
 def load_source(kind, path, tmp, eh):
-    """Возвращает (кол-во кадров, fps источника, функция get(i) -> RGBA Image)"""
+    """Возвращает (кадров, fps источника, функция get(i) -> RGBA Image)"""
     if kind == "tgs":
         from rlottie_python import LottieAnimation
         anim = LottieAnimation.from_tgs(path)
@@ -41,14 +44,23 @@ def load_source(kind, path, tmp, eh):
     return 1, 1.0, lambda i: im
 
 
+def fit(em, eh, W):
+    w0, h0 = em.size
+    scale = min(eh / h0, W / w0)
+    nw, nh = max(2, round(w0 * scale)), max(2, round(h0 * scale))
+    if (nw, nh) != em.size:
+        em = em.resize((nw, nh), Image.LANCZOS)
+    return em
+
+
 def job(d):
     chat, wid = d["chat_id"], d.get("wait_id")
     try:
         W, H, FPS = int(d["w"]), int(d["h"]), int(d["fps"])
+        W -= W % 2
+        H -= H % 2
         size = int(d["size"])
         fmt = d["fmt"]
-        if fmt == "gif":
-            FPS = min(FPS, 50)
         h = d["bg"].lstrip("#")
         bgc = tuple(int(h[i:i + 2], 16) for i in (0, 2, 4))
         eh = max(2, int(H * size / 100) // 2 * 2)
@@ -58,49 +70,47 @@ def job(d):
             open(src, "wb").write(requests.get(d["url"], timeout=30).content)
             count, sfps, get = load_source(d["kind"], src, tmp, eh)
 
-            out = f"{tmp}/out.{fmt}"
-            base = ["ffmpeg", "-y", "-f", "rawvideo", "-pix_fmt", "rgb24",
-                    "-s", f"{W}x{H}", "-r", str(FPS), "-i", "-"]
-            if fmt == "gif":
-                cmd = base + ["-vf", "split[a][b];[a]palettegen[p];[b][p]paletteuse", out]
-            else:
-                cmd = base + ["-c:v", "libx264", "-preset", "ultrafast", "-crf", "23",
-                              "-pix_fmt", "yuv420p", "-movflags", "+faststart", out]
-
-            log = open(f"{tmp}/ff.log", "wb")
-            proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stderr=log)
-
+            out = f"{tmp}/out.mp4"
             bg_img = Image.new("RGB", (W, H), bgc)
-            cache = {}
-            for i in range(FPS * SECONDS):
-                idx = int((i / FPS) * sfps) % count
-                if idx in cache:
-                    em = cache[idx]
-                else:
-                    em = get(idx)
-                    w0, h0 = em.size
-                    nw = max(2, round(w0 * eh / h0))
-                    if (nw, eh) != em.size:
-                        em = em.resize((nw, eh), Image.LANCZOS)
-                    if count == 1:
-                        cache[idx] = em
+
+            def compose(em):
+                em = fit(em, eh, W)
                 frame = bg_img.copy()
                 frame.paste(em, ((W - em.size[0]) // 2, (H - em.size[1]) // 2), em)
-                proc.stdin.write(frame.tobytes())
-            proc.stdin.close()
-            proc.wait(timeout=240)
-            log.close()
-            if proc.returncode:
-                raise RuntimeError(open(f"{tmp}/ff.log", "rb").read()[-800:].decode(errors="ignore"))
+                return frame
 
+            if count == 1:
+                # статичный стикер: один кадр, ffmpeg растягивает его во времени
+                compose(get(0)).save(f"{tmp}/f.png")
+                cmd = ["ffmpeg", "-y", "-loop", "1", "-framerate", str(FPS),
+                       "-i", f"{tmp}/f.png", "-t", str(SECONDS),
+                       *ENC, "-tune", "stillimage", "-r", str(FPS), out]
+                p = subprocess.run(cmd, capture_output=True, timeout=240)
+                if p.returncode:
+                    raise RuntimeError(p.stderr.decode(errors="ignore")[-800:])
+            else:
+                cmd = ["ffmpeg", "-y", "-f", "rawvideo", "-pix_fmt", "rgb24",
+                       "-s", f"{W}x{H}", "-r", str(FPS), "-i", "-", *ENC, out]
+                log = open(f"{tmp}/ff.log", "wb")
+                proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stderr=log)
+                for i in range(FPS * SECONDS):
+                    idx = int((i / FPS) * sfps) % count
+                    proc.stdin.write(compose(get(idx)).tobytes())
+                proc.stdin.close()
+                proc.wait(timeout=240)
+                log.close()
+                if proc.returncode:
+                    raise RuntimeError(open(f"{tmp}/ff.log", "rb").read()[-800:].decode(errors="ignore"))
+
+            # GIF в Telegram = беззвучное mp4, отправленное как animation
             method = "sendAnimation" if fmt == "gif" else "sendVideo"
             field = "animation" if fmt == "gif" else "video"
-            data = {"chat_id": chat}
-            if fmt == "mp4":
-                data.update({"width": W, "height": H})
+            data = {"chat_id": chat, "width": W, "height": H, "duration": SECONDS}
+            if fmt != "gif":
+                data["supports_streaming"] = "true"
             with open(out, "rb") as f:
                 r = requests.post(f"{API}/{method}", data=data,
-                                  files={field: (f"emoji.{fmt}", f)}, timeout=120)
+                                  files={field: ("emoji.mp4", f, "video/mp4")}, timeout=120)
             if not r.json().get("ok"):
                 raise RuntimeError("telegram: " + r.text[:300])
 
