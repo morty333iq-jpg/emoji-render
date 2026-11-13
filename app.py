@@ -1,4 +1,4 @@
-import os, glob, subprocess, tempfile, threading, traceback, requests
+import os, io, glob, subprocess, tempfile, threading, traceback, requests
 from flask import Flask, request, abort
 from PIL import Image
 
@@ -12,6 +12,15 @@ SECONDS = 3
 
 ENC = ["-c:v", "libx264", "-preset", "ultrafast", "-crf", "23",
        "-pix_fmt", "yuv420p", "-an", "-movflags", "+faststart"]
+
+
+def detect_kind(path):
+    head = open(path, "rb").read(16)
+    if head[:2] == b"\x1f\x8b":
+        return "tgs"
+    if head[:4] == b"\x1a\x45\xdf\xa3":
+        return "webm"
+    return "img"
 
 
 def load_source(kind, path, tmp, eh):
@@ -31,11 +40,17 @@ def load_source(kind, path, tmp, eh):
         return n, fps, get
 
     if kind == "webm":
-        subprocess.run(
-            ["ffmpeg", "-y", "-c:v", "libvpx-vp9", "-i", path,
-             "-vf", "fps=30", "-t", str(SECONDS), f"{tmp}/s%04d.png"],
-            capture_output=True, timeout=120, check=True)
-        files = sorted(glob.glob(f"{tmp}/s*.png"))
+        files = []
+        for extra in (["-c:v", "libvpx-vp9"], []):
+            for old in glob.glob(f"{tmp}/s*.png"):
+                os.remove(old)
+            subprocess.run(
+                ["ffmpeg", "-y", *extra, "-i", path, "-vf", "fps=30",
+                 "-pix_fmt", "rgba", "-t", str(SECONDS), f"{tmp}/s%04d.png"],
+                capture_output=True, timeout=120)
+            files = sorted(glob.glob(f"{tmp}/s*.png"))
+            if files:
+                break
         if not files:
             raise RuntimeError("no frames decoded from webm")
         return len(files), 30.0, lambda i: Image.open(files[i]).convert("RGBA")
@@ -62,26 +77,38 @@ def job(d):
         size = int(d["size"])
         fmt = d["fmt"]
         h = d["bg"].lstrip("#")
-        bgc = tuple(int(h[i:i + 2], 16) for i in (0, 2, 4))
+        bgc = tuple(int(h[i:i + 2], 16) for i in (0, 2, 4)) + (255,)
         eh = max(2, int(H * size / 100) // 2 * 2)
 
         with tempfile.TemporaryDirectory() as tmp:
-            src = f"{tmp}/in.{d['kind']}"
+            src = f"{tmp}/in.bin"
             open(src, "wb").write(requests.get(d["url"], timeout=30).content)
-            count, sfps, get = load_source(d["kind"], src, tmp, eh)
+            kind = detect_kind(src)
+            count, sfps, get = load_source(kind, src, tmp, eh)
 
-            out = f"{tmp}/out.mp4"
-            bg_img = Image.new("RGB", (W, H), bgc)
+            bg_img = Image.new("RGBA", (W, H), bgc)
 
             def compose(em):
                 em = fit(em, eh, W)
-                frame = bg_img.copy()
-                frame.paste(em, ((W - em.size[0]) // 2, (H - em.size[1]) // 2), em)
-                return frame
+                layer = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+                layer.paste(em, ((W - em.size[0]) // 2, (H - em.size[1]) // 2))
+                return Image.alpha_composite(bg_img, layer).convert("RGB")
 
+            mid = compose(get(min(count // 2, count - 1)))
+            bbox = get(min(count // 2, count - 1)).getchannel("A").getbbox()
+            print("DEBUG", "kind", kind, "frames", count, "alpha_bbox", bbox,
+                  "out", W, H, FPS, flush=True)
+
+            # превью для Telegram (иначе он показывает чёрный квадрат)
+            th = mid.copy()
+            th.thumbnail((320, 320))
+            buf = io.BytesIO()
+            th.save(buf, "JPEG", quality=85)
+            thumb = buf.getvalue()
+
+            out = f"{tmp}/out.mp4"
             if count == 1:
-                # статичный стикер: один кадр, ffmpeg растягивает его во времени
-                compose(get(0)).save(f"{tmp}/f.png")
+                mid.save(f"{tmp}/f.png")
                 cmd = ["ffmpeg", "-y", "-loop", "1", "-framerate", str(FPS),
                        "-i", f"{tmp}/f.png", "-t", str(SECONDS),
                        *ENC, "-tune", "stillimage", "-r", str(FPS), out]
@@ -109,8 +136,11 @@ def job(d):
             if fmt != "gif":
                 data["supports_streaming"] = "true"
             with open(out, "rb") as f:
-                r = requests.post(f"{API}/{method}", data=data,
-                                  files={field: ("emoji.mp4", f, "video/mp4")}, timeout=120)
+                r = requests.post(
+                    f"{API}/{method}", data=data,
+                    files={field: ("emoji.mp4", f, "video/mp4"),
+                           "thumbnail": ("t.jpg", thumb, "image/jpeg")},
+                    timeout=120)
             if not r.json().get("ok"):
                 raise RuntimeError("telegram: " + r.text[:300])
 
