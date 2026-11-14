@@ -8,7 +8,12 @@ TOKEN = os.environ["BOT_TOKEN"]
 API = f"https://api.telegram.org/bot{TOKEN}"
 
 ERR = '<b><tg-emoji emoji-id="5870657884844462243">❌</tg-emoji> Не получилось сделать</b>'
+ERR_REFUND = ('<b><tg-emoji emoji-id="5870657884844462243">❌</tg-emoji> '
+              'Не получилось сделать. Звёзды вернулись на твой счёт ⭐</b>')
 SECONDS = 3
+
+# одна тяжёлая задача за раз: на бесплатном Render всего 512 МБ памяти
+SEM = threading.Semaphore(1)
 
 ENC = ["-c:v", "libx264", "-preset", "ultrafast", "-crf", "23",
        "-pix_fmt", "yuv420p", "-an", "-movflags", "+faststart"]
@@ -89,78 +94,99 @@ def tg_delete(chat, msg_id):
         pass
 
 
+def refund(d):
+    """Возврат звёзд, если пользователь платил, а ролик не получился"""
+    charge, uid = d.get("charge"), d.get("uid")
+    if not charge or not uid:
+        return False
+    try:
+        r = requests.post(f"{API}/refundStarPayment",
+                          json={"user_id": uid, "telegram_payment_charge_id": charge}, timeout=15)
+        print("REFUND", r.text[:200], flush=True)
+        return bool(r.json().get("ok"))
+    except Exception:
+        print("REFUND ERROR", traceback.format_exc(), flush=True)
+        return False
+
+
+def render_video(d, tmp):
+    W, H, FPS = int(d["w"]), int(d["h"]), int(d["fps"])
+    W -= W % 2
+    H -= H % 2
+    size = int(d["size"])
+    fmt = d["fmt"]
+    h = d["bg"].lstrip("#")
+    bgc = tuple(int(h[i:i + 2], 16) for i in (0, 2, 4)) + (255,)
+    eh = max(2, int(H * size / 100) // 2 * 2)
+
+    src = f"{tmp}/in.bin"
+    open(src, "wb").write(requests.get(d["url"], timeout=30).content)
+    kind = detect_kind(src)
+    count, sfps, get = load_source(kind, src, tmp, eh)
+
+    bg_img = make_background(d, W, H, bgc)
+
+    def compose(em):
+        em = fit(em, eh, W)
+        layer = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+        layer.paste(em, ((W - em.size[0]) // 2, (H - em.size[1]) // 2))
+        return Image.alpha_composite(bg_img, layer).convert("RGB")
+
+    mid = compose(get(min(count // 2, count - 1)))
+    print("DEBUG", "kind", kind, "frames", count,
+          "bg_photo", bool(d.get("bg_url")), "out", W, H, FPS, flush=True)
+
+    th = mid.copy()
+    th.thumbnail((320, 320))
+    buf = io.BytesIO()
+    th.save(buf, "JPEG", quality=85)
+    thumb = buf.getvalue()
+
+    out = f"{tmp}/out.mp4"
+    if count == 1:
+        mid.save(f"{tmp}/f.png")
+        cmd = ["ffmpeg", "-y", "-loop", "1", "-framerate", str(FPS),
+               "-i", f"{tmp}/f.png", "-t", str(SECONDS),
+               *ENC, "-tune", "stillimage", "-r", str(FPS), out]
+        p = subprocess.run(cmd, capture_output=True, timeout=240)
+        if p.returncode:
+            raise RuntimeError(p.stderr.decode(errors="ignore")[-800:])
+    else:
+        cmd = ["ffmpeg", "-y", "-f", "rawvideo", "-pix_fmt", "rgb24",
+               "-s", f"{W}x{H}", "-r", str(FPS), "-i", "-", *ENC, out]
+        log = open(f"{tmp}/ff.log", "wb")
+        proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stderr=log)
+        for i in range(FPS * SECONDS):
+            idx = int((i / FPS) * sfps) % count
+            proc.stdin.write(compose(get(idx)).tobytes())
+        proc.stdin.close()
+        proc.wait(timeout=240)
+        log.close()
+        if proc.returncode:
+            raise RuntimeError(open(f"{tmp}/ff.log", "rb").read()[-800:].decode(errors="ignore"))
+
+    chat = d["chat_id"]
+    method = "sendAnimation" if fmt == "gif" else "sendVideo"
+    field = "animation" if fmt == "gif" else "video"
+    data = {"chat_id": chat, "width": W, "height": H, "duration": SECONDS}
+    if fmt != "gif":
+        data["supports_streaming"] = "true"
+    with open(out, "rb") as f:
+        r = requests.post(
+            f"{API}/{method}", data=data,
+            files={field: ("emoji.mp4", f, "video/mp4"),
+                   "thumbnail": ("t.jpg", thumb, "image/jpeg")},
+            timeout=120)
+    if not r.json().get("ok"):
+        raise RuntimeError("telegram: " + r.text[:300])
+
+
 def job(d):
     chat, wid = d["chat_id"], d.get("wait_id")
     try:
-        W, H, FPS = int(d["w"]), int(d["h"]), int(d["fps"])
-        W -= W % 2
-        H -= H % 2
-        size = int(d["size"])
-        fmt = d["fmt"]
-        h = d["bg"].lstrip("#")
-        bgc = tuple(int(h[i:i + 2], 16) for i in (0, 2, 4)) + (255,)
-        eh = max(2, int(H * size / 100) // 2 * 2)
-
-        with tempfile.TemporaryDirectory() as tmp:
-            src = f"{tmp}/in.bin"
-            open(src, "wb").write(requests.get(d["url"], timeout=30).content)
-            kind = detect_kind(src)
-            count, sfps, get = load_source(kind, src, tmp, eh)
-
-            bg_img = make_background(d, W, H, bgc)
-
-            def compose(em):
-                em = fit(em, eh, W)
-                layer = Image.new("RGBA", (W, H), (0, 0, 0, 0))
-                layer.paste(em, ((W - em.size[0]) // 2, (H - em.size[1]) // 2))
-                return Image.alpha_composite(bg_img, layer).convert("RGB")
-
-            mid = compose(get(min(count // 2, count - 1)))
-            print("DEBUG", "kind", kind, "frames", count,
-                  "bg_photo", bool(d.get("bg_url")), "out", W, H, FPS, flush=True)
-
-            th = mid.copy()
-            th.thumbnail((320, 320))
-            buf = io.BytesIO()
-            th.save(buf, "JPEG", quality=85)
-            thumb = buf.getvalue()
-
-            out = f"{tmp}/out.mp4"
-            if count == 1:
-                mid.save(f"{tmp}/f.png")
-                cmd = ["ffmpeg", "-y", "-loop", "1", "-framerate", str(FPS),
-                       "-i", f"{tmp}/f.png", "-t", str(SECONDS),
-                       *ENC, "-tune", "stillimage", "-r", str(FPS), out]
-                p = subprocess.run(cmd, capture_output=True, timeout=240)
-                if p.returncode:
-                    raise RuntimeError(p.stderr.decode(errors="ignore")[-800:])
-            else:
-                cmd = ["ffmpeg", "-y", "-f", "rawvideo", "-pix_fmt", "rgb24",
-                       "-s", f"{W}x{H}", "-r", str(FPS), "-i", "-", *ENC, out]
-                log = open(f"{tmp}/ff.log", "wb")
-                proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stderr=log)
-                for i in range(FPS * SECONDS):
-                    idx = int((i / FPS) * sfps) % count
-                    proc.stdin.write(compose(get(idx)).tobytes())
-                proc.stdin.close()
-                proc.wait(timeout=240)
-                log.close()
-                if proc.returncode:
-                    raise RuntimeError(open(f"{tmp}/ff.log", "rb").read()[-800:].decode(errors="ignore"))
-
-            method = "sendAnimation" if fmt == "gif" else "sendVideo"
-            field = "animation" if fmt == "gif" else "video"
-            data = {"chat_id": chat, "width": W, "height": H, "duration": SECONDS}
-            if fmt != "gif":
-                data["supports_streaming"] = "true"
-            with open(out, "rb") as f:
-                r = requests.post(
-                    f"{API}/{method}", data=data,
-                    files={field: ("emoji.mp4", f, "video/mp4"),
-                           "thumbnail": ("t.jpg", thumb, "image/jpeg")},
-                    timeout=120)
-            if not r.json().get("ok"):
-                raise RuntimeError("telegram: " + r.text[:300])
+        with SEM:
+            with tempfile.TemporaryDirectory() as tmp:
+                render_video(d, tmp)
 
         # чистим чат: «Делаю…» и (если включена автоочистка) исходный стикер
         if wid:
@@ -169,9 +195,11 @@ def job(d):
             tg_delete(chat, d["src_msg_id"])
     except Exception:
         print("JOB ERROR", traceback.format_exc(), flush=True)
+        refunded = refund(d)
         if wid:
             requests.post(f"{API}/editMessageText", json={
-                "chat_id": chat, "message_id": wid, "parse_mode": "HTML", "text": ERR})
+                "chat_id": chat, "message_id": wid, "parse_mode": "HTML",
+                "text": ERR_REFUND if refunded else ERR})
 
 
 @app.get("/")
