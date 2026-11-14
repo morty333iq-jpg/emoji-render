@@ -82,6 +82,13 @@ def make_background(d, W, H, bgc):
     return base
 
 
+def tg_delete(chat, msg_id):
+    try:
+        requests.post(f"{API}/deleteMessage", json={"chat_id": chat, "message_id": msg_id}, timeout=15)
+    except Exception:
+        pass
+
+
 def job(d):
     chat, wid = d["chat_id"], d.get("wait_id")
     try:
@@ -155,8 +162,11 @@ def job(d):
             if not r.json().get("ok"):
                 raise RuntimeError("telegram: " + r.text[:300])
 
+        # чистим чат: «Делаю…» и (если включена автоочистка) исходный стикер
         if wid:
-            requests.post(f"{API}/deleteMessage", json={"chat_id": chat, "message_id": wid})
+            tg_delete(chat, wid)
+        if d.get("clean") and d.get("src_msg_id"):
+            tg_delete(chat, d["src_msg_id"])
     except Exception:
         print("JOB ERROR", traceback.format_exc(), flush=True)
         if wid:
